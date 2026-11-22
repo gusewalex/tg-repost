@@ -1,9 +1,9 @@
 """
 Автоматичний репост нових публікацій з одного Telegram-каналу в інший.
 
-Режими (змінна MODE у .env):
-  forward - пересилання з позначкою "Forwarded from" (зберігає авторство, рекомендовано)
-  copy    - копія поста без позначки про пересилання
+Режими (змінна MODE):
+  copy    - публікація як новий пост від імені вашого каналу + підпис внизу (за замовчуванням)
+  forward - пересилання з позначкою "Forwarded from"
 """
 import asyncio
 import json
@@ -13,8 +13,9 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
+from telethon.errors import FloodWaitError, MediaCaptionTooLongError
 from telethon.sessions import StringSession
-from telethon.errors import FloodWaitError
+from telethon.tl.types import MessageEntityTextUrl
 
 load_dotenv()
 
@@ -22,11 +23,15 @@ API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 SOURCE = os.getenv("SOURCE", "Tsaplienko")
 TARGET_RAW = os.environ["TARGET"]  # @username або числовий id (-100...)
-MODE = os.getenv("MODE", "forward").lower()
+MODE = os.getenv("MODE", "copy").lower()
 STATE_FILE = Path(os.getenv("STATE_FILE", "state.json"))
 SESSION = os.getenv("SESSION", "repost_session")
 SESSION_STRING = os.getenv("SESSION_STRING")  # для GitHub Actions
 RUN_ONCE = os.getenv("RUN_ONCE", "0") == "1"  # один прохід і вихід
+
+# Підпис внизу кожної публікації (порожній FOOTER_TEXT = без підпису)
+FOOTER_TEXT = os.getenv("FOOTER_TEXT", "🇺🇦 Review News / Підписатися")
+FOOTER_URL = os.getenv("FOOTER_URL", "https://t.me/reviewnews")
 
 TARGET = int(TARGET_RAW) if TARGET_RAW.lstrip("-").isdigit() else TARGET_RAW
 
@@ -53,18 +58,83 @@ def save_last_id(msg_id: int):
         STATE_FILE.write_text(json.dumps({"last_id": msg_id}))
 
 
+def u16(s: str) -> int:
+    """Довжина в UTF-16 одиницях (так Telegram рахує зсуви форматування)."""
+    return len(s.encode("utf-16-le")) // 2
+
+
+def with_footer(msg):
+    """Повертає (текст, entities) з доданим підписом-посиланням."""
+    text = msg.raw_text or ""
+    entities = list(msg.entities or [])
+    if not FOOTER_TEXT:
+        return text, entities
+    sep = "\n\n" if text else ""
+    offset = u16(text + sep)
+    entities.append(
+        MessageEntityTextUrl(offset=offset, length=u16(FOOTER_TEXT), url=FOOTER_URL)
+    )
+    return text + sep + FOOTER_TEXT, entities
+
+
+def footer_markdown() -> str:
+    return f"[{FOOTER_TEXT}]({FOOTER_URL})" if FOOTER_TEXT else ""
+
+
+async def send_single(m):
+    """Один пост як новий (без 'Переслано з') + підпис."""
+    text, entities = with_footer(m)
+
+    # Звичайний текст або текст із прев'ю посилання
+    if not m.media or m.web_preview:
+        await client.send_message(
+            TARGET,
+            text,
+            formatting_entities=entities,
+            link_preview=bool(m.web_preview),  # прев'ю лише якщо було в оригіналі
+        )
+        return
+
+    # Фото, відео, документи, голосові тощо
+    if m.photo or (m.document and not m.sticker):
+        try:
+            await client.send_file(
+                TARGET, m.media, caption=text, formatting_entities=entities
+            )
+        except MediaCaptionTooLongError:
+            # Підпис задовгий для медіа: медіа окремо, текст окремим повідомленням
+            await client.send_file(TARGET, m.media)
+            await client.send_message(
+                TARGET, text, formatting_entities=entities, link_preview=False
+            )
+        return
+
+    # Опитування, стікери, геолокація тощо: копіюємо як є, без підпису
+    await client.send_message(TARGET, m)
+
+
+async def send_album(msgs):
+    """Альбом як новий + підпис у підписі першого елемента."""
+    captions = [m.text or "" for m in msgs]  # markdown зі збереженням форматування
+    footer = footer_markdown()
+    if footer:
+        captions[0] = (captions[0] + "\n\n" + footer) if captions[0] else footer
+    try:
+        await client.send_file(TARGET, [m.media for m in msgs], caption=captions)
+    except MediaCaptionTooLongError:
+        await client.send_file(TARGET, [m.media for m in msgs])
+        await client.send_message(
+            TARGET, "\n\n".join(c for c in captions if c), link_preview=False
+        )
+
+
 async def send(msgs, source_entity):
-    """Надсилає один пост або альбом у цільовий канал."""
     if MODE == "forward":
         await client.forward_messages(TARGET, msgs, from_peer=source_entity)
     elif len(msgs) > 1:
-        await client.send_file(
-            TARGET,
-            [m.media for m in msgs],
-            caption=[m.text or "" for m in msgs],
-        )
+        await send_album(msgs)
     else:
-        await client.send_message(TARGET, msgs[0])
+        await send_single(msgs[0])
 
 
 async def relay(msgs):
