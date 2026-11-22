@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -28,6 +29,9 @@ STATE_FILE = Path(os.getenv("STATE_FILE", "state.json"))
 SESSION = os.getenv("SESSION", "repost_session")
 SESSION_STRING = os.getenv("SESSION_STRING")  # для GitHub Actions
 RUN_ONCE = os.getenv("RUN_ONCE", "0") == "1"  # один прохід і вихід
+POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "10"))  # як часто звіряти джерело, с
+ALBUM_SETTLE = 3  # скільки секунд чекати, поки догрузиться альбом
+MAX_BACKLOG = int(os.getenv("MAX_BACKLOG", "20"))  # макс. пропущених постів після простою
 
 # Підпис внизу кожної публікації (порожній FOOTER_TEXT = без підпису)
 FOOTER_TEXT = os.getenv("FOOTER_TEXT", "🇺🇦 Review News / Підписатися")
@@ -41,7 +45,12 @@ logging.basicConfig(
 log = logging.getLogger("repost")
 
 client = TelegramClient(
-    StringSession(SESSION_STRING) if SESSION_STRING else SESSION, API_ID, API_HASH
+    StringSession(SESSION_STRING) if SESSION_STRING else SESSION,
+    API_ID,
+    API_HASH,
+    connection_retries=-1,  # безкінечні спроби перепідключення
+    retry_delay=2,
+    auto_reconnect=True,
 )
 lock = asyncio.Lock()  # щоб пости йшли суворо по черзі
 
@@ -137,72 +146,101 @@ async def send(msgs, source_entity):
         await send_single(msgs[0])
 
 
-async def relay(msgs):
-    msgs = sorted(msgs, key=lambda m: m.id)
+fails: dict = {}
+
+
+async def deliver(group) -> bool:
+    """Надсилає пост/альбом. True = йти далі, False = повторити пізніше."""
+    key = group[0].id
+    for _ in range(3):
+        try:
+            source_entity = await client.get_input_entity(SOURCE)
+            await send(group, source_entity)
+            save_last_id(group[-1].id)
+            log.info("Репост виконано: %s", [m.id for m in group])
+            return True
+        except FloodWaitError as e:
+            log.warning("FloodWait: чекаю %s с", e.seconds)
+            await asyncio.sleep(e.seconds + 1)
+        except Exception:
+            log.exception("Помилка репосту %s", [m.id for m in group])
+            fails[key] = fails.get(key, 0) + 1
+            if fails[key] >= 3:
+                log.error("Пропускаю пост %s після 3 невдач", key)
+                save_last_id(group[-1].id)
+                return True
+            return False
+    return False
+
+
+async def sync():
+    """Репостить усе нове з джерела. Безпечно викликати з кількох місць одразу."""
     async with lock:
-        for attempt in range(3):
-            try:
-                source_entity = await client.get_input_entity(SOURCE)
-                await send(msgs, source_entity)
-                save_last_id(msgs[-1].id)
-                log.info("Репост виконано: %s", [m.id for m in msgs])
-                return
-            except FloodWaitError as e:
-                log.warning("FloodWait: чекаю %s с", e.seconds)
-                await asyncio.sleep(e.seconds + 1)
-            except Exception:
-                log.exception("Помилка репосту %s", [m.id for m in msgs])
-                return
+        last_id = load_last_id()
+        if last_id is None:
+            latest = await client.get_messages(SOURCE, limit=1)
+            save_last_id(latest[0].id if latest else 0)
+            log.info("Перший запуск: історію не репостимо, стартуємо з нових постів.")
+            return
+
+        fetched = await client.get_messages(SOURCE, min_id=last_id, limit=None)
+        if not fetched:
+            return
+        real = sorted((m for m in fetched if not m.action), key=lambda m: m.id)
+        if not real:  # лише службові повідомлення
+            save_last_id(max(m.id for m in fetched))
+            return
+        if len(real) > MAX_BACKLOG:
+            log.warning("Пропущено %d постів, беру останні %d", len(real), MAX_BACKLOG)
+            real = real[-MAX_BACKLOG:]
+
+        groups, order = {}, []
+        for m in real:
+            key = m.grouped_id or f"single-{m.id}"
+            if key not in groups:
+                groups[key] = []
+                order.append(key)
+            groups[key].append(m)
+
+        now = datetime.now(timezone.utc)
+        for key in order:
+            group = groups[key]
+            if group[0].grouped_id and (now - group[-1].date).total_seconds() < ALBUM_SETTLE:
+                break  # альбом ще догружається, візьмемо на наступному проході
+            if not await deliver(group):
+                break  # зберігаємо порядок: спробуємо ще раз пізніше
 
 
 @client.on(events.NewMessage(chats=SOURCE))
 async def on_new(event):
-    if event.message.grouped_id:  # альбоми обробляє events.Album
-        return
-    if event.message.action:  # службові повідомлення
-        return
-    await relay([event.message])
+    """Миттєва реакція на новий пост."""
+    if event.message.grouped_id:
+        await asyncio.sleep(ALBUM_SETTLE)
+    try:
+        await sync()
+    except Exception:
+        log.exception("Помилка обробки події")
 
 
-@client.on(events.Album(chats=SOURCE))
-async def on_album(event):
-    await relay(list(event.messages))
-
-
-async def catch_up():
-    """Підхоплює пости, пропущені, поки скрипт не працював."""
-    last_id = load_last_id()
-    if last_id is None:
-        latest = await client.get_messages(SOURCE, limit=1)
-        save_last_id(latest[0].id if latest else 0)
-        log.info("Перший запуск: історію не репостимо, стартуємо з нових постів.")
-        return
-
-    missed = await client.get_messages(SOURCE, min_id=last_id, limit=None)
-    missed = [m for m in missed if not m.action]
-    if not missed:
-        return
-    log.info("Пропущених постів: %d", len(missed))
-
-    groups, order = {}, []
-    for m in sorted(missed, key=lambda x: x.id):
-        key = m.grouped_id or f"single-{m.id}"
-        if key not in groups:
-            groups[key] = []
-            order.append(key)
-        groups[key].append(m)
-    for key in order:
-        await relay(groups[key])
-        await asyncio.sleep(1)
+async def poller():
+    """Страховка: регулярно звіряє джерело, навіть якщо Telegram не надіслав подію."""
+    while True:
+        try:
+            await sync()
+        except Exception:
+            log.exception("Помилка опитування (продовжую)")
+        await asyncio.sleep(POLL_INTERVAL)
 
 
 async def main():
     await client.start()  # при першому запуску попросить номер і код
-    await catch_up()
     if RUN_ONCE:
+        await sync()
         log.info("Режим одного проходу завершено.")
         return
-    log.info("Слухаю @%s -> %s (режим: %s)", SOURCE, TARGET_RAW, MODE)
+    log.info("Стежу за @%s -> %s (режим: %s, опитування кожні %.0f с)",
+             SOURCE, TARGET_RAW, MODE, POLL_INTERVAL)
+    asyncio.create_task(poller())
     await client.run_until_disconnected()
 
 
