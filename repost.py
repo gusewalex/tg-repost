@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -29,6 +30,7 @@ STATE_FILE = Path(os.getenv("STATE_FILE", "state.json"))
 SESSION = os.getenv("SESSION", "repost_session")
 SESSION_STRING = os.getenv("SESSION_STRING")  # для GitHub Actions
 RUN_ONCE = os.getenv("RUN_ONCE", "0") == "1"  # один прохід і вихід
+RUN_SECONDS = int(os.getenv("RUN_SECONDS", "0"))  # >0: працювати цей час і вийти (для GitHub Actions)
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "10"))  # як часто звіряти джерело, с
 ALBUM_SETTLE = 3  # скільки секунд чекати, поки догрузиться альбом
 MAX_BACKLOG = int(os.getenv("MAX_BACKLOG", "20"))  # макс. пропущених постів після простою
@@ -238,6 +240,17 @@ async def main():
     if RUN_ONCE:
         await sync()
         log.info("Режим одного проходу завершено.")
+        return
+    if RUN_SECONDS > 0:
+        end = time.monotonic() + RUN_SECONDS
+        log.info("Цикл на %d с, опитування кожні %.0f с", RUN_SECONDS, POLL_INTERVAL)
+        while time.monotonic() < end:
+            try:
+                await sync()
+            except Exception:
+                log.exception("Помилка опитування (продовжую)")
+            await asyncio.sleep(POLL_INTERVAL)
+        await client.disconnect()
         return
     log.info("Стежу за @%s -> %s (режим: %s, опитування кожні %.0f с)",
              SOURCE, TARGET_RAW, MODE, POLL_INTERVAL)
