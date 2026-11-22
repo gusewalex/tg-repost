@@ -64,6 +64,7 @@ def load_last_id():
 def save_last_id(msg_id: int):
     current = load_last_id() or 0
     if msg_id > current:
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
         STATE_FILE.write_text(json.dumps({"last_id": msg_id}))
 
 
