@@ -1,0 +1,9 @@
+services:
+  repost:
+    build: .
+    restart: always
+    env_file: .env
+    environment:
+      STATE_FILE: /data/state.json
+    volumes:
+      - ./data:/data
