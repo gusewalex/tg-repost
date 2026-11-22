@@ -3,5 +3,6 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY repost.py .
+RUN mkdir -p /data
 ENV STATE_FILE=/data/state.json
 CMD ["python", "-u", "repost.py"]
