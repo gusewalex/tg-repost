@@ -1,9 +1,12 @@
 """
-Автоматичний репост нових публікацій з одного Telegram-каналу в інший.
+Автоматичний репост нових публікацій з кількох Telegram-каналів в один.
 
 Режими (змінна MODE):
   copy    - публікація як новий пост від імені вашого каналу + підпис внизу (за замовчуванням)
   forward - пересилання з позначкою "Forwarded from"
+
+Джерела: змінна SOURCES через кому, напр. SOURCES=Tsaplienko,another_channel,-1001234567890
+(стара змінна SOURCE теж працює, якщо SOURCES не задано)
 """
 import asyncio
 import json
@@ -23,7 +26,6 @@ load_dotenv()
 
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
-SOURCE = os.getenv("SOURCE", "Tsaplienko")
 TARGET_RAW = os.environ["TARGET"]  # @username або числовий id (-100...)
 MODE = os.getenv("MODE", "copy").lower()
 STATE_FILE = Path(os.getenv("STATE_FILE", "state.json"))
@@ -31,13 +33,24 @@ SESSION = os.getenv("SESSION", "repost_session")
 SESSION_STRING = os.getenv("SESSION_STRING")  # для GitHub Actions
 RUN_ONCE = os.getenv("RUN_ONCE", "0") == "1"  # один прохід і вихід
 RUN_SECONDS = int(os.getenv("RUN_SECONDS", "0"))  # >0: працювати цей час і вийти (для GitHub Actions)
-POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "10"))  # як часто звіряти джерело, с
+POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "10"))  # як часто звіряти джерела, с
 ALBUM_SETTLE = 3  # скільки секунд чекати, поки догрузиться альбом
-MAX_BACKLOG = int(os.getenv("MAX_BACKLOG", "20"))  # макс. пропущених постів після простою
+MAX_BACKLOG = int(os.getenv("MAX_BACKLOG", "20"))  # макс. пропущених постів після простою (на джерело)
 
 # Підпис внизу кожної публікації (порожній FOOTER_TEXT = без підпису)
 FOOTER_TEXT = os.getenv("FOOTER_TEXT", "🇺🇦 Review News / Підписатися")
 FOOTER_URL = os.getenv("FOOTER_URL", "https://t.me/reviewnews")
+
+
+def parse_peer(value: str):
+    value = value.strip().lstrip("@")
+    return int(value) if value.lstrip("-").isdigit() else value
+
+
+_sources_raw = os.getenv("SOURCES") or os.getenv("SOURCE", "Tsaplienko,redactor_news")
+SOURCES = [parse_peer(s) for s in _sources_raw.split(",") if s.strip()]
+if not SOURCES:
+    raise SystemExit("Не задано жодного джерела (SOURCES)")
 
 TARGET = int(TARGET_RAW) if TARGET_RAW.lstrip("-").isdigit() else TARGET_RAW
 
@@ -57,17 +70,30 @@ client = TelegramClient(
 lock = asyncio.Lock()  # щоб пости йшли суворо по черзі
 
 
-def load_last_id():
-    if STATE_FILE.exists():
-        return json.loads(STATE_FILE.read_text()).get("last_id")
-    return None
+# ---------- Стан: окремий last_id для кожного джерела ----------
+# ID повідомлень унікальні лише в межах одного каналу, тому зберігаємо їх окремо.
+
+def load_state() -> dict:
+    if not STATE_FILE.exists():
+        return {}
+    data = json.loads(STATE_FILE.read_text())
+    if "ids" in data:
+        return data["ids"]
+    if "last_id" in data:  # старий формат: один last_id належав першому джерелу
+        return {str(SOURCES[0]): data["last_id"]}
+    return {}
 
 
-def save_last_id(msg_id: int):
-    current = load_last_id() or 0
-    if msg_id > current:
+def load_last_id(source):
+    return load_state().get(str(source))
+
+
+def save_last_id(source, msg_id: int):
+    state = load_state()
+    if msg_id > (state.get(str(source)) or 0):
+        state[str(source)] = msg_id
         STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        STATE_FILE.write_text(json.dumps({"last_id": msg_id}))
+        STATE_FILE.write_text(json.dumps({"ids": state}, ensure_ascii=False, indent=2))
 
 
 def u16(s: str) -> int:
@@ -152,71 +178,81 @@ async def send(msgs, source_entity):
 fails: dict = {}
 
 
-async def deliver(group) -> bool:
+async def deliver(source, group) -> bool:
     """Надсилає пост/альбом. True = йти далі, False = повторити пізніше."""
-    key = group[0].id
+    key = (str(source), group[0].id)
     for _ in range(3):
         try:
-            source_entity = await client.get_input_entity(SOURCE)
+            source_entity = await client.get_input_entity(source)
             await send(group, source_entity)
-            save_last_id(group[-1].id)
-            log.info("Репост виконано: %s", [m.id for m in group])
+            save_last_id(source, group[-1].id)
+            log.info("Репост виконано [%s]: %s", source, [m.id for m in group])
             return True
         except FloodWaitError as e:
             log.warning("FloodWait: чекаю %s с", e.seconds)
             await asyncio.sleep(e.seconds + 1)
         except Exception:
-            log.exception("Помилка репосту %s", [m.id for m in group])
+            log.exception("Помилка репосту [%s] %s", source, [m.id for m in group])
             fails[key] = fails.get(key, 0) + 1
             if fails[key] >= 3:
                 log.error("Пропускаю пост %s після 3 невдач", key)
-                save_last_id(group[-1].id)
+                save_last_id(source, group[-1].id)
                 return True
             return False
     return False
 
 
+async def sync_source(source):
+    """Репостить усе нове з одного джерела."""
+    last_id = load_last_id(source)
+    if last_id is None:
+        latest = await client.get_messages(source, limit=1)
+        save_last_id(source, latest[0].id if latest else 0)
+        log.info("[%s] Перший запуск: історію не репостимо, стартуємо з нових постів.", source)
+        return
+
+    fetched = await client.get_messages(source, min_id=last_id, limit=None)
+    if not fetched:
+        return
+    real = sorted((m for m in fetched if not m.action), key=lambda m: m.id)
+    if not real:  # лише службові повідомлення
+        save_last_id(source, max(m.id for m in fetched))
+        return
+    if len(real) > MAX_BACKLOG:
+        log.warning("[%s] Пропущено %d постів, беру останні %d", source, len(real), MAX_BACKLOG)
+        real = real[-MAX_BACKLOG:]
+
+    groups, order = {}, []
+    for m in real:
+        key = m.grouped_id or f"single-{m.id}"
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(m)
+
+    now = datetime.now(timezone.utc)
+    for key in order:
+        group = groups[key]
+        if group[0].grouped_id and (now - group[-1].date).total_seconds() < ALBUM_SETTLE:
+            break  # альбом ще догружається, візьмемо на наступному проході
+        if not await deliver(source, group):
+            break  # зберігаємо порядок: спробуємо ще раз пізніше
+
+
 async def sync():
-    """Репостить усе нове з джерела. Безпечно викликати з кількох місць одразу."""
+    """Проходить по всіх джерелах. Безпечно викликати з кількох місць одразу."""
     async with lock:
-        last_id = load_last_id()
-        if last_id is None:
-            latest = await client.get_messages(SOURCE, limit=1)
-            save_last_id(latest[0].id if latest else 0)
-            log.info("Перший запуск: історію не репостимо, стартуємо з нових постів.")
-            return
-
-        fetched = await client.get_messages(SOURCE, min_id=last_id, limit=None)
-        if not fetched:
-            return
-        real = sorted((m for m in fetched if not m.action), key=lambda m: m.id)
-        if not real:  # лише службові повідомлення
-            save_last_id(max(m.id for m in fetched))
-            return
-        if len(real) > MAX_BACKLOG:
-            log.warning("Пропущено %d постів, беру останні %d", len(real), MAX_BACKLOG)
-            real = real[-MAX_BACKLOG:]
-
-        groups, order = {}, []
-        for m in real:
-            key = m.grouped_id or f"single-{m.id}"
-            if key not in groups:
-                groups[key] = []
-                order.append(key)
-            groups[key].append(m)
-
-        now = datetime.now(timezone.utc)
-        for key in order:
-            group = groups[key]
-            if group[0].grouped_id and (now - group[-1].date).total_seconds() < ALBUM_SETTLE:
-                break  # альбом ще догружається, візьмемо на наступному проході
-            if not await deliver(group):
-                break  # зберігаємо порядок: спробуємо ще раз пізніше
+        for source in SOURCES:
+            try:
+                await sync_source(source)
+            except Exception:
+                # помилка одного джерела не повинна блокувати інші
+                log.exception("Помилка синхронізації джерела %s", source)
 
 
-@client.on(events.NewMessage(chats=SOURCE))
+@client.on(events.NewMessage(chats=SOURCES))
 async def on_new(event):
-    """Миттєва реакція на новий пост."""
+    """Миттєва реакція на новий пост з будь-якого джерела."""
     if event.message.grouped_id:
         await asyncio.sleep(ALBUM_SETTLE)
     try:
@@ -226,7 +262,7 @@ async def on_new(event):
 
 
 async def poller():
-    """Страховка: регулярно звіряє джерело, навіть якщо Telegram не надіслав подію."""
+    """Страховка: регулярно звіряє джерела, навіть якщо Telegram не надіслав подію."""
     while True:
         try:
             await sync()
@@ -252,8 +288,8 @@ async def main():
             await asyncio.sleep(POLL_INTERVAL)
         await client.disconnect()
         return
-    log.info("Стежу за @%s -> %s (режим: %s, опитування кожні %.0f с)",
-             SOURCE, TARGET_RAW, MODE, POLL_INTERVAL)
+    log.info("Стежу за %s -> %s (режим: %s, опитування кожні %.0f с)",
+             ", ".join(str(s) for s in SOURCES), TARGET_RAW, MODE, POLL_INTERVAL)
     asyncio.create_task(poller())
     await client.run_until_disconnected()
 
