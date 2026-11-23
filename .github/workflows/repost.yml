@@ -2,7 +2,7 @@ name: Telegram repost
 
 on:
   schedule:
-    - cron: "*/15 * * * *"   # страховка: перезапустить ланцюжок, якщо він урветься
+    - cron: "*/15 * * * *"   # страховка: перезапустити ланцюжок, якщо він урветься
   workflow_dispatch:          # ручний запуск і самозапуск наступного кола
 
 permissions:
@@ -33,7 +33,7 @@ jobs:
           API_HASH: ${{ secrets.API_HASH }}
           SESSION_STRING: ${{ secrets.SESSION_STRING }}
           TARGET: ${{ secrets.TARGET }}
-          SOURCE: Tsaplienko
+          SOURCES: Tsaplienko,redactor_news
           MODE: copy
           RUN_SECONDS: "270"
           POLL_INTERVAL: "10"
